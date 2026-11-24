@@ -10,9 +10,6 @@ Prueba T-ISO-8: la suma por tenant == total y no hay solapamiento (cada ítem ti
 import argparse
 import sys
 
-import boto3
-from boto3.dynamodb.conditions import Key
-
 MS = {
     "ms-auth": ["sp_usuarios"],
     "ms-cursos": ["sp_cursos", "sp_modulos", "sp_matriculas"],
@@ -37,6 +34,7 @@ def contar_sql(nombre, tenant):
 
 
 def contar(tabla, tenant):
+    from boto3.dynamodb.conditions import Key
     total, kw = 0, {"KeyConditionExpression": Key("tenant_id").eq(tenant), "Select": "COUNT"}
     while True:
         r = tabla.query(**kw)
@@ -47,15 +45,25 @@ def contar(tabla, tenant):
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--tenants", default="UTEC,NORTE,ANDINO")
     ap.add_argument("--region", default="us-east-1")
+    ap.add_argument("--sin-practica", action="store_true",
+                    help="Omite ms-practica (sp_tarjetas) del reporte y del código de salida")
+    ap.add_argument("--only", default="",
+                    help="Filtrar microservicios (auth,cursos,evaluaciones,analitica,notificaciones,practica)")
     a = ap.parse_args()
-    tenants = a.tenants.split(",")
+    tenants = [t.strip().upper() for t in a.tenants.split(",") if t.strip()]
+    solo = {("ms-" + s.strip().removeprefix("ms-")) for s in a.only.split(",") if s.strip()}
+    import boto3
     db = boto3.resource("dynamodb", region_name=a.region)
     ok_global = True
     print(f"{'microservicio':<20}{'tabla':<20}" + "".join(f"{t:>9}" for t in tenants) + f"{'TOTAL':>10}")
     for ms, tablas in MS.items():
+        if a.sin_practica and ms == "ms-practica":
+            continue
+        if solo and ms not in solo:
+            continue
         total_ms = 0
         for nombre in tablas:
             try:
@@ -63,8 +71,10 @@ def main():
             except Exception as e:  # tabla aún no desplegada
                 print(f"{ms:<20}{nombre:<20}  (no disponible: {type(e).__name__})")
                 continue
-            total_ms += sum(conteos)
-            print(f"{ms:<20}{nombre:<20}" + "".join(f"{c:>9}" for c in conteos) + f"{sum(conteos):>10}")
+            total_tabla = sum(conteos)
+            total_ms += total_tabla
+            aviso = "  [AVISO: posible duplicado de otro día]" if nombre == "sp_notificaciones" and total_tabla > MINIMO * 1.5 else ""
+            print(f"{ms:<20}{nombre:<20}" + "".join(f"{c:>9}" for c in conteos) + f"{total_tabla:>10}{aviso}")
         marca = "OK " if total_ms >= MINIMO else "FALTA"
         ok_global &= total_ms >= MINIMO
         print(f"{'':<20}{'→ ' + marca + ' total ' + ms:<20}{'':>{9 * len(tenants)}}{total_ms:>10}\n")

@@ -368,7 +368,43 @@ def _tabla(nombre, region):
     return _local.res.Table(nombre)
 
 
-def escribir(nombre, items, region, workers):
+def escribir(nombre, items, region, workers, solo_nuevos=False):
+    from botocore.exceptions import ClientError
+
+    if solo_nuevos:
+        # Inserta solo ítems inexistentes: evita pisar cuentas migradas a 600k por ms-auth.
+        def insertar_uno(it):
+            try:
+                _tabla(nombre, region).put_item(
+                    Item=it,
+                    ConditionExpression="attribute_not_exists(tenant_id) AND attribute_not_exists(user_id)",
+                )
+                return 1, 0
+            except ClientError as e:
+                code = e.response.get("Error", {}).get("Code")
+                if code == "ConditionalCheckFailedException":
+                    return 0, 1
+                raise
+
+        creados, omitidos, hecho = 0, 0, 0
+        try:
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                for c, o in ex.map(insertar_uno, items):
+                    creados += c
+                    omitidos += o
+                    hecho += 1
+                    if hecho % 250 == 0 or hecho == len(items):
+                        print(f"\r  {nombre:<18} {hecho:>7}/{len(items)}  (nuevos={creados}, conservados={omitidos})",
+                              end="", flush=True)
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") == "ResourceNotFoundException":
+                ms = MS_DE_TABLA.get(nombre, "desconocido")
+                print(f"\n  [ERROR] La tabla DynamoDB '{nombre}' no existe. Despliega ms-{ms} o exclúyelo con --only/--sin-practica.")
+                raise SystemExit(1) from None
+            raise
+        print()
+        return
+
     trozos = [items[i:i + 250] for i in range(0, len(items), 250)]
 
     def lote(trozo):
@@ -378,11 +414,27 @@ def escribir(nombre, items, region, workers):
         return len(trozo)
 
     hecho = 0
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        for n in ex.map(lote, trozos):
-            hecho += n
-            print(f"\r  {nombre:<18} {hecho:>7}/{len(items)}", end="", flush=True)
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for n in ex.map(lote, trozos):
+                hecho += n
+                print(f"\r  {nombre:<18} {hecho:>7}/{len(items)}", end="", flush=True)
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "ResourceNotFoundException":
+            ms = MS_DE_TABLA.get(nombre, "desconocido")
+            print(f"\n  [ERROR] La tabla DynamoDB '{nombre}' no existe. Despliega ms-{ms} o exclúyelo con --only/--sin-practica.")
+            raise SystemExit(1) from None
+        raise
     print()
+
+
+def _parse_fecha_base(valor):
+    if not valor:
+        return datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    try:
+        return datetime.strptime(valor, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        raise SystemExit(f"Fecha inválida en --fecha-base: '{valor}' (usa formato YYYY-MM-DD)") from None
 
 
 def main():
@@ -390,16 +442,29 @@ def main():
     ap.add_argument("--tenants", default="UTEC,NORTE,ANDINO")
     ap.add_argument("--per-tenant", type=int, default=10_000)
     ap.add_argument("--only", default="", help="auth,cursos,evaluaciones,analitica,notificaciones,practica")
+    ap.add_argument("--sin-practica", action="store_true",
+                    help="Excluye ms-practica (sp_tarjetas) si ese microservicio opcional no está desplegado")
+    ap.add_argument("--fecha-base", default="",
+                    help="Fecha fija YYYY-MM-DD (UTC) para evitar duplicar notificaciones al re-ejecutar otro día")
+    ap.add_argument("--conservar-usuarios", action="store_true",
+                    help="En sp_usuarios no sobrescribe cuentas existentes (protege hashes migrados a 600k por ms-auth)")
     ap.add_argument("--region", default="us-east-1")
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
     tenants = [t.strip().upper() for t in a.tenants.split(",") if t.strip()]
+    validos = set(MS_DE_TABLA.values())
     solo = {s.strip() for s in a.only.split(",") if s.strip()}
-    ahora = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)  # fijo por día: repetir el seed el mismo día no duplica filas
+    invalidos = solo - validos
+    if invalidos:
+        raise SystemExit(f"Microservicios desconocidos en --only: {sorted(invalidos)}. Válidos: {sorted(validos)}")
+    activos = (solo or set(validos)) - ({"practica"} if a.sin_practica else set())
+    if not activos:
+        raise SystemExit("No quedó ningún microservicio activo tras aplicar --only y --sin-practica.")
+    ahora = _parse_fecha_base(a.fecha_base)
 
     acumulado = {k: [] for k in MS_DE_TABLA}
-    print(f"Generando datos ({a.per_tenant} alumnos por tenant, semilla {SEED})...")
+    print(f"Generando datos ({a.per_tenant} alumnos por tenant, semilla {SEED}, fecha base {ahora.strftime('%Y-%m-%d')})...")
     for tid in tenants:
         datos, niveles = generar_tenant(tid, a.per_tenant, ahora)
         for k, v in datos.items():
@@ -408,24 +473,26 @@ def main():
 
     print("\nConteos por tabla y tenant:")
     for tabla, items in acumulado.items():
-        if solo and MS_DE_TABLA[tabla] not in solo:
+        if MS_DE_TABLA[tabla] not in activos:
             continue
         por_t = {t: sum(1 for i in items if i["tenant_id"] == t) for t in tenants}
         print(f"  {tabla:<18} total {len(items):>7}  " + "  ".join(f"{t}={c}" for t, c in por_t.items()))
     if a.dry_run:
         print("\n(dry-run: no se escribió nada en AWS)")
         return
-    sql_activas = [t for t in SQL_TABLAS if not solo or MS_DE_TABLA[t] in solo]
+    sql_activas = [t for t in SQL_TABLAS if MS_DE_TABLA[t] in activos]
     if sql_activas:
         print("\nEscribiendo en RDS MySQL (esquema por tenant)...  [DB_HOST, DB_USER, DB_PASSWORD]")
         for tid in tenants:
             cargar_sql(tid, {t: [i for i in acumulado[t] if i["tenant_id"] == tid] for t in sql_activas})
-    print("\nEscribiendo en DynamoDB...")
-    for tabla, items in acumulado.items():
-        if (solo and MS_DE_TABLA[tabla] not in solo) or tabla in SQL_TABLAS:
-            continue
-        escribir(tabla, items, a.region, a.workers)
-    print("\nListo. Verifica con:  python verify_counts.py")
+    dynamo_activas = [t for t in acumulado if MS_DE_TABLA[t] in activos and t not in SQL_TABLAS]
+    if dynamo_activas:
+        print("\nEscribiendo en DynamoDB...")
+        for tabla in dynamo_activas:
+            escribir(tabla, acumulado[tabla], a.region, a.workers,
+                     solo_nuevos=(a.conservar_usuarios and tabla == "sp_usuarios"))
+    extra = " --sin-practica" if a.sin_practica else ""
+    print(f"\nListo. Verifica con:  python verify_counts.py{extra}")
 
 
 if __name__ == "__main__":
