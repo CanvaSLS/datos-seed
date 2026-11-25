@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""seed.py · datos ficticios multi-tenant para StudyPulse (rúbrica: >= 30 000 registros por
+"""seed.py · datos ficticios multi-tenant para CanvaSLS (rúbrica: >= 30 000 registros por
 microservicio, repartidos en 3 tenants -> >= 10 000 por tenant y por microservicio).
 
   python seed.py --dry-run                       # genera en memoria y muestra conteos (sin AWS)
